@@ -8,7 +8,6 @@ import torch.nn as nn
 from torch_sparse import SparseTensor
 from torch_sparse import remove_diag, to_torch_sparse, set_diag
 from copy import deepcopy
-
 from data_loader_hgb import data_loader
 import gc
 import torch.nn.functional as F
@@ -20,51 +19,24 @@ def adj_mask_sparse(A, B):
     rowB, colB, _ = B.coo()
     indexA = rowA * A.size(1) + colA
     indexB = rowB * A.size(1) + colB
-    ###针对freebase mask的问题，但是没有完全解决，A.masked_select_nnz会OOM###
-    # chunk_size = 100000
-    # mask_list = []
-    # for i in range(0, len(indexA), chunk_size):
-    #     chunk = indexA[i:i+chunk_size]
-    #     mask = ~torch.isin(chunk, indexB)
-    #     mask_list.append(mask)
-    # mask = torch.cat(mask_list)
-    ######################################################################
     nnz_mask = ~(torch.isin(indexA, indexB))
     A = A.masked_select_nnz(nnz_mask)
     return A
 
-def adj_mask(a, b, rede):
-    # mask = b.to_dense().gt(0)
-    # a = a.to_dense().masked_fill(mask, 0)
-
-    # mask = b.to_dense()
-    # a = a.to_dense()*(mask<=0).float()
-    a_nnz = a.nnz()
-    b_nnz = b.nnz()
-    print(a_nnz,b_nnz)
+def adj_mask(a, b):
     mask = b.to(torch.bool).to_dense()
     a = a.to_dense()
     a = torch.where(mask, 0, a)
     a = a.to_sparse().coalesce()
     a = SparseTensor(row=a.indices()[0], col=a.indices()[1], value = a.values(), sparse_sizes=a.size())
-    print("new", a.nnz())
-    #print("de-redundancy", ((a_nnz-a.nnz())/a_nnz)*100)
-    if a_nnz!=0:
-        rede = rede + ((a_nnz-a.nnz())/a_nnz)*100
-    ###第三种实际速度应该是最快的###
-    #a = torch.masked_fill(a, mask, 0) 跟torch.where速度基本一样
-    return a, rede
+    return a
 
 def adj_mask_freebase(a, b):
     mask = b.to(torch.bool).to_dense()
     a = a.to_dense()
     a = torch.where(mask, 0, a)
-    ###第三种实际速度应该是最快的###
-    #a = torch.masked_fill(a, mask, 0) 跟torch.where速度基本一样
-    #### for Freebase case############
     a = a.to_sparse()
     a = SparseTensor(row=a.indices()[0], col=a.indices()[1], value = a.values(), sparse_sizes=a.size())
-    ##################################
     return a
 
 def generate_mask_subgraph(s):
@@ -82,86 +54,55 @@ def generate_mask_subgraph(s):
         for j in range(i+1, len(s)):
             graph[i].append(j)
 
-    # 进行 DFS 遍历
+    #DFS
     paths = []
     dfs(graph, 0, [], paths)
     paths_list = set()
-    # 输出结果
+
     for path in paths:
         if len(path)<len(s):
             paths_list.add(''.join(s[i] for i in path))
     #print("generate subgraph to mask", paths_list)
     return paths_list
 
-
-
-def hg_propagate_sparse_pyg_A(adjs, features_list_dict_cp, tgt_types, num_hops, max_length, extra_metapath, threshold_metalen, prop_device, enhance, prop_feats=False, echo=False):
-    store_device = 'cpu'
+def pre_feature_prop(adjs, features_list_dict_cp, tgt_types, num_hops, max_length, threshold_metalen, prop_device, enhance, prop_feats=False, echo=False):
     if type(tgt_types) is not list:
         tgt_types = [tgt_types]
     features_list_dict = deepcopy(features_list_dict_cp)
-    adj_dict = {k: v.clone() for k, v in adjs.items() if prop_feats or k[-1] in tgt_types} # metapath should start with target type in label propagation
+    adj_dict = {k: v.clone() for k, v in adjs.items() if prop_feats or k[-1] in tgt_types}
     adjs_g = {k: v.to(prop_device) for k, v in adjs.items()}
 
     for k,v in features_list_dict.items():
         features_list_dict[k] = v.to(prop_device)
 
     for k,v in adj_dict.items():
-        #print('Generating ...', k)
         features_list_dict[k] = (v.to(prop_device) @ features_list_dict[k[-1]].to(prop_device))
-        ############去掉@ features_list_dict[k[-1]]保持与其他metapath一样的sparse格式。
     # compute k-hop feature
-    rede_buffer = []
     for hop in range(2, max_length):
-        reserve_heads = [ele[-(hop+1):] for ele in extra_metapath if len(ele) > hop]
         new_adjs = {}
-        for rtype_r, adj_r in adj_dict.items(): ###遍历所有metapath，每轮都会将新hop的metapaths更新到adjk_dict
-            #metapath_types = list(rtype_r)
-            if len(rtype_r) == hop:   ###只计算metapath==hop的
+        for rtype_r, adj_r in adj_dict.items():
+            if len(rtype_r) == hop: 
                 dtype_r, stype_r = rtype_r[0], rtype_r[-1] #stype, _, dtype = g.to_canonical_etype(etype)
-                for rtype_l, adj_l in adjs_g.items():   ### 固定的：dict_keys(['PP', 'PA', 'AP', 'PC', 'CP'])
+                for rtype_l, adj_l in adjs_g.items():
                     dtype_l, stype_l = rtype_l
                     if stype_l == dtype_r:  #rtype_l @ rtype_r
                         name = f'{dtype_l}{rtype_r}'
-                        if (hop == num_hops and dtype_l not in tgt_types and name not in reserve_heads) \
-                          or (hop > num_hops and name not in reserve_heads):   ###如果hop为3，避免生成APPP这种类型
+                        if (hop == num_hops and dtype_l not in tgt_types) \
+                          or (hop > num_hops):
                             continue
                         if name not in new_adjs:
-                            #if echo: print('Generating ...', name)
-                            if prop_device == 'cpu':
-                                new_adjs[name] = adj_l.matmul(adj_r)    ##每次左乘A  两个sparse  都到gpu上可以做
-                                if hop >= threshold_metalen:
-                                    #print("use SGA scheme to mask")
+                            with torch.no_grad():
+                                new_adjs[name] = (adj_l.matmul(adj_r.to(prop_device))).to('cpu')
+                                if hop >= 2:
+                                    print("use de-redundancy scheme to mask", name)
                                     mask_adj_list = generate_mask_subgraph(name)
                                     for mask in mask_adj_list:
-                                        print(mask)
                                         if mask in adj_dict:
-                                            new_adjs[name] = adj_mask(new_adjs[name], adj_dict[mask])  ##这里返回的是sparse
-                                        #assert new_adjs[name].equal(buffer.to_dense())
-                                features_list_dict[name] = new_adjs[name].to(prop_device).matmul(features_list_dict[stype_r])  #稀疏乘密集  rtype_r[-1] == stype_r   features_list_dict需要转成稀疏
-                            else:
-                                with torch.no_grad():
-                                    new_adjs[name] = (adj_l.matmul(adj_r.to(prop_device))).to('cpu')    ##每次左乘A  两个sparse
-                                    if hop >= threshold_metalen:
-                                        print("use SGA scheme to mask", name)
-                                        mask_adj_list = generate_mask_subgraph(name)
-                                        rede = 0
-                                        for mask in mask_adj_list:
-                                            if mask in adj_dict:
-                                                print(mask)
-                                                new_adjs[name], rede = adj_mask(new_adjs[name], adj_dict[mask], rede)  ##这里返回的是sparse
-                                                #assert new_adjs[name].equal(buffer.to_dense())
-                                        end = time.time()
-                                        print("de-redundancy", round(rede,2))
-                                        rede_buffer.append(round(rede,2))
-                                        #print("time for mask", end - start)
-                                    features_list_dict[name] = (new_adjs[name].to(prop_device).matmul(features_list_dict[stype_r])).to('cpu')  #rtype_r[-1] == stype_r   features_list_dict需要转成稀疏
-                                    #features_list_dict[name] = (new_adjs[name].to(prop_device)).to('cpu')  #rtype_r[-1] == stype_r   features_list_dict需要转成稀疏
-
+                                            new_adjs[name] = adj_mask(new_adjs[name], adj_dict[mask])
+                                features_list_dict[name] = (new_adjs[name].to(prop_device).matmul(features_list_dict[stype_r])).to('cpu')
                         else:
                             if echo: print(f'Warning: {name} already exists')
         adj_dict.update(new_adjs)
-    print(rede_buffer)
     removes = []
     for k in features_list_dict.keys():
         if k[0] == tgt_types[0]: continue
@@ -191,57 +132,42 @@ def hg_propagate_sparse_pyg_A(adjs, features_list_dict_cp, tgt_types, num_hops, 
         print(extra_features_buffer.keys())
         for k,v in extra_features_buffer.items():
             extra_features_buffer[k] = torch.stack(v, dim=1)
-
-    # del new_adjs
-    # del adj_dict
-    gc.collect()
     if prop_device != 'cpu':
         del adjs_g
         torch.cuda.empty_cache()
     return features_list_dict, extra_features_buffer
 
-def hg_propagate_sparse_pyg_freebase(adjs, threshold_metalen, tgt_types, num_hops, max_length, extra_metapath, prop_device, enhance, prop_feats=False, echo=False):
+def pre_feature_prop_freebase(adjs, threshold_metalen, tgt_types, num_hops, max_length, prop_device, enhance, prop_feats=False, echo=False):
     store_device = 'cpu'
     if type(tgt_types) is not list:
         tgt_types = [tgt_types]
 
     label_feats = {k: v.clone().to(prop_device) for k, v in adjs.items() if prop_feats or k[-1] in tgt_types} # metapath should start with target type in label propagation
     adjs_g = {k: v.to(prop_device) for k, v in adjs.items()}
-    count = 0
+
     for hop in range(2, max_length):
-        reserve_heads = [ele[-(hop+1):] for ele in extra_metapath if len(ele) > hop]
         new_adjs = {}
-        for rtype_r, adj_r in label_feats.items(): ###遍历所有metapath
+        for rtype_r, adj_r in label_feats.items():
             metapath_types = list(rtype_r)
             if len(metapath_types) == hop:
-                dtype_r, stype_r = metapath_types[0], metapath_types[-1]  ###拆分metapath
-                for rtype_l, adj_l in adjs_g.items():   ### 聚合所有的stype
+                dtype_r, stype_r = metapath_types[0], metapath_types[-1]
+                for rtype_l, adj_l in adjs_g.items():
                     dtype_l, stype_l = rtype_l
                     if stype_l == dtype_r:
                         name = f'{dtype_l}{rtype_r}'
-                        if (hop == num_hops and dtype_l not in tgt_types and name not in reserve_heads) \
-                          or (hop > num_hops and name not in reserve_heads):
+                        if (hop == num_hops and dtype_l not in tgt_types) \
+                          or (hop > num_hops):
                             continue
                         if name not in new_adjs:
                             if echo: print('Generating ...', name)
-                            if prop_device == 'cpu':
-                                new_adjs[name] = adj_l.matmul(adj_r)    ##每次左乘A
-                                if hop >= threshold_metalen:
-                                    print("use SGA scheme to mask")
+                            with torch.no_grad():
+                                new_adjs[name] = adj_l.matmul(adj_r.to(prop_device))#.to(store_device)
+                                if hop >= 2:
                                     mask_adj_list = generate_mask_subgraph(name)
                                     for mask in mask_adj_list:
                                         if mask in label_feats:
-                                            new_adjs[name] = adj_mask_sparse(new_adjs[name], label_feats[mask])  ##这里是tensor没有转换
-                            else:
-                                with torch.no_grad():
-                                    #new_adjs[name] = adj_l.matmul(adj_r.to(prop_device)).to(store_device)
-                                    new_adjs[name] = adj_l.matmul(adj_r.to(prop_device))#.to(store_device)
-                                    if hop >= threshold_metalen:
-                                        print(f"use SGA scheme to mask {name}")
-                                        mask_adj_list = generate_mask_subgraph(name)
-                                        for mask in mask_adj_list:
-                                            if mask in label_feats:
-                                                new_adjs[name] = adj_mask_sparse(new_adjs[name], label_feats[mask])  ## .to(store_device)   这里是tensor没有转换
+                                            print(mask)
+                                            new_adjs[name] = adj_mask_sparse(new_adjs[name], label_feats[mask])  ## .to(store_device)   这里是tensor没有转换
                         else:
                             if echo: print(f'Warning: {name} already exists')
         label_feats.update(new_adjs)
@@ -258,26 +184,7 @@ def hg_propagate_sparse_pyg_freebase(adjs, threshold_metalen, tgt_types, num_hop
         del new_adjs
         gc.collect()
 
-    name_list = []
     extra_features_buffer = {}
-    if enhance:
-        keys = list(label_feats.keys())
-        for k in keys:
-            if len(k) >= threshold_metalen+1:
-                print("threshold_metalen", k)
-                mid_name = 'X'*(len(k)-2)
-                name = f'{k[0]}'f'{mid_name}'f'{k[-1]}'
-                if name in name_list:
-                    extra_features_buffer.setdefault(name,[]).append(label_feats.pop(k))
-                    #features_list_dict[name] = features_list_dict[name] + features_list_dict.pop(k)
-                else:
-                    name_list.append(name)
-                    extra_features_buffer.setdefault(name,[]).append(label_feats.pop(k))
-
-        print(extra_features_buffer.keys())
-        for k,v in extra_features_buffer.items():
-            extra_features_buffer[k] = torch.stack(v, dim=1)
-
     if prop_device != 'cpu':
         del adjs_g
         torch.cuda.empty_cache()
@@ -290,18 +197,15 @@ def hg_propagate_sparse_pyg_freebase(adjs, threshold_metalen, tgt_types, num_hop
     return label_feats_new, extra_features_buffer
 
 
-def hg_propagate_sparse_pyg_mask(adjs, tgt_types, num_hops, max_length, extra_metapath, prop_feats=False, echo=False, prop_device='cpu'):
+def pre_label_feats(adjs, tgt_types, num_hops, max_length, prop_feats=False, echo=False, prop_device='cpu'):
     store_device = 'cpu'
     if type(tgt_types) is not list:
         tgt_types = [tgt_types]
 
     label_feats = {k: v.clone().to(prop_device) for k, v in adjs.items() if prop_feats or k[-1] in tgt_types} # metapath should start with target type in label propagation
     adjs_g = {k: v.to(prop_device) for k, v in adjs.items()}
-    for k in adjs.keys():
-        print('Generating ...', k)
 
     for hop in range(2, max_length):
-        reserve_heads = [ele[-(hop+1):] for ele in extra_metapath if len(ele) > hop]
         new_adjs = {}
         for rtype_r, adj_r in label_feats.items(): ###遍历所有metapath
             metapath_types = list(rtype_r)
@@ -311,31 +215,13 @@ def hg_propagate_sparse_pyg_mask(adjs, tgt_types, num_hops, max_length, extra_me
                     dtype_l, stype_l = rtype_l
                     if stype_l == dtype_r:
                         name = f'{dtype_l}{rtype_r}'
-                        if (hop == num_hops and dtype_l not in tgt_types and name not in reserve_heads) \
-                          or (hop > num_hops and name not in reserve_heads):
+                        if (hop == num_hops and dtype_l not in tgt_types) \
+                          or (hop > num_hops):
                             continue
                         if name not in new_adjs:
-                            if echo: print('Generating ...', name)
-                            if prop_device == 'cpu':
-                                new_adjs[name] = adj_l.matmul(adj_r)
-                                if hop >= 1:
-                                    print("label mask", name)
-                                    mask_adj_list = generate_mask_subgraph(name)
-                                    for mask in mask_adj_list:
-                                        print(mask)
-                                        if mask in label_feats:
-                                            new_adjs[name] = adj_mask_sparse(new_adjs[name], label_feats[mask])  ##这里返回的是sparse
-                            else:
-                                with torch.no_grad():
-                                    new_adjs[name] = adj_l.matmul(adj_r.to(prop_device))#.to(store_device)
-                                    if hop >= 1:
-                                        print("label mask", name)
-                                        mask_adj_list = generate_mask_subgraph(name)
-                                        for mask in mask_adj_list:
-                                            print(mask)
-                                            if mask in label_feats:
-                                                new_adjs[name] = adj_mask_sparse(new_adjs[name], label_feats[mask].to(prop_device)) ##这里返回的是sparse
-                                        new_adjs[name] = new_adjs[name].to(store_device)
+                            with torch.no_grad():
+                                new_adjs[name] = adj_l.matmul(adj_r.to(prop_device))#.to(store_device)
+                                new_adjs[name] = new_adjs[name].to(store_device)
                         else:
                             if echo: print(f'Warning: {name} already exists')
         label_feats.update(new_adjs)
@@ -358,61 +244,24 @@ def hg_propagate_sparse_pyg_mask(adjs, tgt_types, num_hops, max_length, extra_me
 
     return label_feats
 
-def hg_propagate_sparse_pyg(adjs, tgt_types, num_hops, max_length, extra_metapath, prop_feats=False, echo=False, prop_device='cpu'):
-    store_device = 'cpu'
-    if type(tgt_types) is not list:
-        tgt_types = [tgt_types]
 
-    label_feats = {k: v.clone() for k, v in adjs.items() if prop_feats or k[-1] in tgt_types} # metapath should start with target type in label propagation
-    adjs_g = {k: v.to(prop_device) for k, v in adjs.items()}
-    for k in adjs.keys():
-        print('Generating ...', k)
-
-    for hop in range(2, max_length):
-        reserve_heads = [ele[-(hop+1):] for ele in extra_metapath if len(ele) > hop]
-        new_adjs = {}
-        for rtype_r, adj_r in label_feats.items(): ###遍历所有metapath
-            metapath_types = list(rtype_r)
-            if len(metapath_types) == hop:
-                dtype_r, stype_r = metapath_types[0], metapath_types[-1]  ###拆分metapath
-                for rtype_l, adj_l in adjs_g.items():   ### 聚合所有的stype
-                    dtype_l, stype_l = rtype_l
-                    if stype_l == dtype_r:
-                        name = f'{dtype_l}{rtype_r}'
-                        if (hop == num_hops and dtype_l not in tgt_types and name not in reserve_heads) \
-                          or (hop > num_hops and name not in reserve_heads):
-                            continue
-                        if name not in new_adjs:
-                            if echo: print('Generating ...', name)
-                            if prop_device == 'cpu':
-                                new_adjs[name] = adj_l.matmul(adj_r)
-                            else:
-                                with torch.no_grad():
-                                    new_adjs[name] = adj_l.matmul(adj_r.to(prop_device)).to(store_device)
-                        else:
-                            if echo: print(f'Warning: {name} already exists')
-        label_feats.update(new_adjs)
-
-        removes = []
-        for k in label_feats.keys():
-            metapath_types = list(k)
-            if metapath_types[0] in tgt_types: continue  # metapath should end with target type in label propagation
-            if len(metapath_types) <= hop:
-                removes.append(k)
-        for k in removes:
-            label_feats.pop(k)
-        if echo and len(removes): print('remove', removes)
-        del new_adjs
-        gc.collect()
-
-    if prop_device != 'cpu':
-        del adjs_g
-        torch.cuda.empty_cache()
-
-    return label_feats
+def load_data(device, args):
+    if args.cpu_preprocess:
+        device = "cpu"
+    with torch.no_grad():
+        if args.dataset.startswith("ACM"):
+            return load_dataset(device, args)
+        if args.dataset.startswith("DBLP"):
+            return load_dataset(device, args)
+        if args.dataset.startswith("IMDB"):
+            return load_dataset(device, args)
+        if args.dataset.startswith("Freebase"):
+            return load_dataset(device, args)
+        else:
+            raise RuntimeError(f"Dataset {args.dataset} not supported")
 
 def load_dataset(args):
-    dl = data_loader(f'{args.root}/{args.dataset}')   ##origin
+    dl = data_loader(f'{args.root}/{args.dataset}/{args.dataset}')
     # use one-hot index vectors for nods with no attributes
     # === feats ===
     features_list = []
@@ -432,8 +281,8 @@ def load_dataset(args):
     init_labels = np.zeros((dl.nodes['count'][0], num_classes), dtype=int)
 
     val_ratio = 0.2
-    train_nid = np.nonzero(dl.labels_train['mask'])[0]   ###统计label不为0的
-    np.random.shuffle(train_nid)  ###每次都是打乱的train_nid
+    train_nid = np.nonzero(dl.labels_train['mask'])[0]
+    np.random.shuffle(train_nid)
     split = int(train_nid.shape[0]*val_ratio)
     val_nid = train_nid[:split]
     train_nid = train_nid[split:]
@@ -451,11 +300,6 @@ def load_dataset(args):
     print(len(train_nid), len(val_nid), len(test_nid), len(test_nid_full))
     init_labels = torch.LongTensor(init_labels)
 
-    # === adjs ===
-    # print(dl.nodes['attr'])
-    # for k, v in dl.nodes['attr'].items():
-    #     if v is None: print('none')
-    #     else: print(v.shape)
     adjs = [] if args.dataset != 'Freebase' else {}
     for i, (k, v) in enumerate(dl.links['data'].items()):
         v = v.tocoo()
@@ -465,7 +309,6 @@ def load_dataset(args):
         col = v.col - idx_shift[src_type_idx]
         sparse_sizes = (dl.nodes['count'][dst_type_idx], dl.nodes['count'][src_type_idx])
         adj = SparseTensor(row=torch.LongTensor(row), col=torch.LongTensor(col), sparse_sizes=sparse_sizes)
-        #adj = torch.sparse.FloatTensor(indices, values, shape)
         if args.dataset == 'Freebase':
             name = f'{dst_type_idx}{src_type_idx}'
             assert name not in adjs
@@ -512,7 +355,6 @@ def load_dataset(args):
         g.nodes['P'].data['P'] = P
         g.nodes['T'].data['T'] = T
         g.nodes['V'].data['V'] = V
-        ########### test cos########################
     elif args.dataset == 'IMDB':
         # A --- M* --- D
         #       |
@@ -569,7 +411,6 @@ def load_dataset(args):
         # field     : None
         P, A, C, K = features_list
         features_list_dict = {}
-
         features_list_dict['P'] = P
         features_list_dict['A'] = A
         features_list_dict['C'] = C
@@ -587,9 +428,9 @@ def load_dataset(args):
 
         row0, col0, _ = PP.coo()
         row1, col1, _ = PP_r.coo()
-        PP = SparseTensor(row=torch.cat((row0, row1)), col=torch.cat((col0, col1)), sparse_sizes=PP.sparse_sizes())  ##设置为对称矩阵 PP.is_symmetric()
-        PP = PP.coalesce()  ###这里作用是去重
-        PP = PP.set_diag()  ###对角线全部置1  ??
+        PP = SparseTensor(row=torch.cat((row0, row1)), col=torch.cat((col0, col1)), sparse_sizes=PP.sparse_sizes())
+        PP = PP.coalesce()
+        PP = PP.set_diag()
         adjs = [PP] + adjs[2:]
 
         new_edges = {}
@@ -643,6 +484,7 @@ def load_dataset(args):
         features_list_dict['5'] = _5
         features_list_dict['6'] = _6
         features_list_dict['7'] = _7
+
         adjs['00'] = adjs['00'].to_symmetric()
         g = None
     else:
@@ -661,10 +503,10 @@ def load_dataset(args):
             if dtype != stype:
                 new_name = f'{stype}{dtype}'
                 assert new_name not in adjs
-                new_adjs[new_name] = adj.t()    ###为每个类型添加对称关系
+                new_adjs[new_name] = adj.t()
         adjs.update(new_adjs)
         g = None
     else:
         assert 0
 
-    return g, adjs, features_list_dict, init_labels, num_classes, dl, train_nid, val_nid, test_nid, test_nid_full
+    return g, adjs, features_list_dict, init_labels, num_classes, dl, train_nid, val_nid, test_nid
